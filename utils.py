@@ -206,6 +206,145 @@ def min_max_scale_bags(bags, minv = -1., maxv = 1.):
     assert(np.allclose(bags_scaled[-1][:, -1], bags_concat[:, -1]))
     return bags_scaled
 
+def load_chest(chest_path, img_split = None, modality= None, model = "pftas", model_kwargs = None, min_max_scale= False, blood_features = None, static_features = None, target= None, cls = "finding"):
+    assert(not min_max_scale)
+    ## Set default model params
+    if model == "hog":
+        raise Exception(f"Unsupported Model: {model}")
+        ## Num features of HOG = orientations * , approximately proportional to cells_per_block and 1 / pixels_per_cell, 
+        ## Exact features of HOG = int((width / pixelspercell[0]) - (cellsperblock[0] -1)) * int((width / pixelspercell[1]) - (cellsperblock[1] -1)) * (cellsperblock[0] * cellsperblock[1]) * orientations
+        if model_kwargs is None: model_kwargs = dict(orientations= 4, pixels_per_cell=(12, 12), cells_per_block=(2, 2), visualize= True, multichannel=True)
+    elif model == "pftas":
+        if model_kwargs is None: model_kwargs = dict()
+    else:
+        raise Exception(f"Unsupported Model: {model}")
+    # if patch_width_height_num_list is None: patch_width_height_num_list = [[64, 64, 1]] ## Multi-modalities of instance = the patches in different shapes and sizes.
+    if img_split is None:
+        img_split = [2, 2]
+    if modality is None:
+        modality = [[{"view": "PA", "modality": "X-ray"}, {"view": "AP", "modality": "X-ray"}, {"view": "AP Supine", "modality": "X-ray"}], [{"view": "L", "modality": "X-ray"}], [{"view": None, "modality": "CT"}]] ## 3 + 1 modalities
+    if blood_features is None:
+        blood_features = ["temperature", "pO2_saturation", "leukocyte_count", "neutrophil_count", "lymphocyte_count", ]
+    if static_features is None:
+        static_features = ["sex", "age", "RT_PCR_positive"]
+
+    
+    print(f"Chest X-ray dataset: Generating patches with {model}")
+
+    bags = OrderedDict()  # pftas 2D array will contain all 162 (54 for gray image) * num_concatenations features for each patch
+    target = OrderedDict()  # target array (patch is either malignant or benign)
+    cls_bags = OrderedDict()
+    image_path = OrderedDict()
+    x = OrderedDict()
+    bags_M = OrderedDict()
+    y = OrderedDict()
+    similarities = OrderedDict()
+    stats = OrderedDict()
+    stat_features = ["offset"]
+
+    M_cut_idx = [0]
+    for size in [len(static_features), 1, len(blood_features)]:
+        M_cut_idx.append(M_cut_idx[-1] + size) ## Following Python indexing, 
+    for mode in modality:
+        for x_step in range(img_split[0]):
+            for y_step in range(img_split[1]):
+                M_cut_idx.append(M_cut_idx[-1] + 54) ## 54 for gray image
+
+    df = pd.read_csv(f'{chest_path}/metadata.csv')
+    df['sex'] = df['sex'].map({"M": 0.0, "F": 1.0})
+    df['RT_PCR_positive'] = df['RT_PCR_positive'].map({"N": 0.0, "Y": 1.0})
+    df = df.groupby("patientid")
+    # if_first_M_cut_check = True
+    for bag_idx, bag in tqdm(df): ## bag level
+        for var in [bags, target, x, y, similarities, bags_M, image_path, stats, cls_bags]: ## create bag
+            var[bag_idx] = []
+
+        first_row = bag.iloc[0]
+        instance_base_static = first_row[static_features].fillna(0.0).tolist()
+        instance_base_static_mask = (1. - first_row[static_features].isna()).tolist()
+        bag_label = "Y" if (bag["survival"] == "N").any() or (bag["intubation_present"] == "Y").any() or (bag["needed_supplemental_O2"] == "Y").any() else "N"
+        for offset, df_step in bag.groupby("offset"): ## instances of combinations level, multiple instances can be generated from the single offset (timestep).
+            first_first_row = df_step.iloc[0]
+            modality_list_of_row = [[] for i in range(len(modality))] ## [[None], [0, 2], [1]]
+            for row_idx in range(len(df_step)):
+                row = df_step.iloc[row_idx]
+                for modality_num in range(len(modality)):
+                    for match in modality[modality_num]:
+                        if_matched = True
+                        for key in match.keys():
+                            if not (match[key] is None or row[key] == match[key]):
+                                if_matched = False
+                        if if_matched:
+                            modality_list_of_row[modality_num].append(row_idx)
+
+            for list_of_row in modality_list_of_row:
+                if len(list_of_row) == 0: list_of_row.append(None)
+            list_of_instances_row_ind = list(itertools.product(*modality_list_of_row)) ## [[None, 0, 1], [None, 2, 1]]
+
+            instance_base_dynamic = [offset] + first_first_row[blood_features].fillna(0.0).tolist()
+            instance_base_dynamic_mask = [1.0] + (1. - first_first_row[blood_features].isna()).tolist()
+            # target[bag_idx].append(df_step.iloc[0]["survival"])
+            target[bag_idx].append(bag_label)
+            cls_bags[bag_idx].append(first_first_row[cls].split("/")[-1])
+            for list_of_rows in list_of_instances_row_ind: ## instance level
+                instance = deepcopy(instance_base_static) + deepcopy(instance_base_dynamic)
+                instance_mask = deepcopy(instance_base_static_mask) + deepcopy(instance_base_dynamic_mask)
+                for var in [x, y, image_path]:
+                    var[bag_idx].append([])
+
+                for row_idx in list_of_rows:
+                    if row_idx is None or not any([df_step.iloc[row_idx]["filename"].endswith(extension) for extension in [".jpeg", ".jpg", ".png"]]):
+                        instance = instance + [0.0 for i in range(54 * img_split[0] * img_split[1])]
+                        instance_mask = instance_mask + [0.0 for i in range(54 * img_split[0] * img_split[1])]
+                        for i in range(img_split[0] * img_split[1]): x[bag_idx][-1].append(None)
+                        for i in range(img_split[0] * img_split[1]): y[bag_idx][-1].append(None)
+                        image_path[bag_idx][-1].append(None)
+                    else:
+                        row_modality = df_step.iloc[row_idx]
+                        if False:
+                            img = imageio.imread(f'{chest_path}/images/{row_modality["filename"]}')
+                        else:
+                            img= cv2.imread(f'{chest_path}/images/{row_modality["filename"]}', 0)
+                            img = cv2.equalizeHist(img)
+                        image_path[bag_idx][-1].append(f'{chest_path}/images/{row_modality["filename"]}')
+
+                        step_sizes = [int(img.shape[0] / img_split[0]), int(img.shape[1] / img_split[1])]
+                        for x_step in range(img_split[0]):
+                            for y_step in range(img_split[1]):
+                                x_range = (step_sizes[0] * x_step, step_sizes[0] * (x_step + 1))
+                                y_range = (step_sizes[1] * y_step, step_sizes[1] * (y_step + 1))
+                                x[bag_idx][-1].append(x_range)
+                                y[bag_idx][-1].append(y_range)
+                                subimg = img[x_range[0] : x_range[1], y_range[0] : y_range[1]]
+                                if model == "pftas":
+                                    processed_patch = mahotas.features.pftas(subimg, **model_kwargs)
+                                elif model == "hog":
+                                    processed_patch, hog_image = hog(subimg, **model_kwargs)
+                                processed_patch = list(processed_patch)
+                                assert(not any(np.isnan(processed_patch)))
+                                # if if_first_M_cut_check: 
+                                #     M_cut_idx.append(M_cut_idx[-1] + 54)
+                                instance = instance + processed_patch
+                                instance_mask = instance_mask + [1.0 for i in range(54)]
+                bags[bag_idx].append(instance)
+                bags_M[bag_idx].append(instance_mask)
+                stats[bag_idx].append({key: first_first_row[key] for key in stat_features})
+                # if_first_M_cut_check = False
+        for i in range(len(bags[bag_idx])):
+            similarities[bag_idx].append([])
+            for j in range(len(bags[bag_idx])):
+                similarities[bag_idx][i].append(1. / max(1e-1, abs(float(stats[bag_idx][i]["offset"]) - float(stats[bag_idx][j]["offset"]))))
+        if (len(bags[bag_idx]) == 0) or any([label is None for label in target[bag_idx]]) or any([label != target[bag_idx][0] for label in target[bag_idx]]):
+        # if (len(bags[bag_idx]) == 0):
+            for var in [bags, target, x, y, bags_M, image_path, similarities, stats, cls_bags]:
+                # assert(len(var[bag_idx]) == 0)
+                del var[bag_idx]
+        else:
+            if False: bags[bag_idx].append([float(bag_idx) for i in range(len(bags[bag_idx][0]))])
+    # if current_num_bags < max_num_bags: print(f"The maximum number of bags is {max_num_bags}, but we generate {current_num_bags} bags.")
+    # len([target[key] for key in target.keys() if any([elem == "N" for elem in target[key]])]) -> label distribution.
+    return dict_to_list(bags), dict_to_list(target), dict_to_list(image_path), dict_to_list(x), dict_to_list(y), M_cut_idx, dict_to_list(bags_M), dict_to_list(similarities), dict_to_list(cls_bags)
+
 def chest_dataset_output(bags, target, image_path, x, y, M_cut_idx, bags_M, similarities, cls_bags):
     def cls_bag_filter(elem):
         if False: ## RT_PCR_positive

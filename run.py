@@ -60,15 +60,23 @@ if True:
 results_dict = {model: {} for model in models_dict.keys()}
 dataset_kind = "synthetic_mi" ## 
 
-# models_dict["ours"]["init_kwargs"]["normal_int_ratio"] = [-1.6, 1.6]
-class_radius = {"A": 1.5, "B": 3}
-class_abnormal_threshold = {"A": 4, "B": 14}
-class_to_color = {"A": "green", "B": "brown"}
-lines_gt, xlim_set, ylim_set = None, None, None
+if dataset_kind == "chest-xray":
+    models_dict["ours"]["init_kwargs"]["normal_int_ratio"] = [-1.2, 1.2]
+    models_dict["ours"]["init_kwargs"]["kernel_kwargs"]["sigma"] = 1.2
+    dataset_raw =utils.load_chest(chest_path= "path/to/chest_dataset")
+    image_path = dataset_raw[2]
+    dataset = utils.chest_dataset_output(*dataset_raw)
+    bags, cls_bags, is_normal = dataset[0], dataset[1], dataset[2]
+else:
+    # models_dict["ours"]["init_kwargs"]["normal_int_ratio"] = [-1.6, 1.6]
+    class_radius = {"A": 1.5, "B": 3}
+    class_abnormal_threshold = {"A": 4, "B": 14}
+    class_to_color = {"A": "green", "B": "brown"}
+    lines_gt, xlim_set, ylim_set = None, None, None
 
-circles_dicts_class = [dict(xy= [0, 0], radius= class_abnormal_threshold[cls], edgecolor= class_to_color[cls], fill= False, linestyle= "-", linewidth= None) for cls in class_abnormal_threshold.keys()]
+    circles_dicts_class = [dict(xy= [0, 0], radius= class_abnormal_threshold[cls], edgecolor= class_to_color[cls], fill= False, linestyle= "-", linewidth= None) for cls in class_abnormal_threshold.keys()]
 
-bags, cls_bags, is_normal, circles_dicts, min_max_dict, cls_bags_known = utils.load_synthetic_mi(class_radius, class_abnormal_threshold, num_points_factor = 1.0)
+    bags, cls_bags, is_normal, circles_dicts, min_max_dict, cls_bags_known = utils.load_synthetic_mi(class_radius, class_abnormal_threshold, num_points_factor = 1.0)
 splits = utils.train_test_split_wrap(is_normal, int_of_target= int_of_target)
 
 output_path = "/Users/projects/python/PUMISVM/output"
